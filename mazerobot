@@ -1,0 +1,493 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+
+// ================= PIN =================
+#define BTN_START   PB10
+#define BTN_DIRECT  PB11
+#define LED         PB2
+#define XSHUT_L     PA3
+#define XSHUT_R     PA4
+#define XSHUT_F     PA5
+#define AIN1        PA8
+#define AIN2        PB15
+#define BIN1        PB14
+#define BIN2        PB13
+#define PWMA        PA0
+#define PWMB        PA1
+#define STBY        PB0
+#define ENRA        PB4
+#define ENRB        PB5
+#define ENLA        PA6
+#define ENLB        PA7
+
+// ================= PARAM =================
+// Tốc độ
+#define SPEED_A         49
+#define SPEED_B         58
+#define SPEED_TURN      50
+#define RAMP_STEP       3
+#define RAMP_DELAY      15
+
+// Góc quay (xung encoder)
+#define TURN_90         210
+#define STEP_PULSE      500
+
+// Ngưỡng cảm biến
+#define THRESHOLD_F     200
+#define THRESHOLD_LR    300
+
+// Hệ số PID
+#define KP              1.8f
+
+// ================= DELAYS =================
+#define DELAY_STOP_MOTOR        50   // Delay sau khi stopMotor()
+#define DELAY_TRANSITION        50   // Delay khi  chuyển trạng thái
+#define DELAY_AFTER_TURN        50   // Delay sau khi quay xong
+#define DELAY_BEFORE_SCAN       50   // Delay trước khi scan
+#define DELAY_SENSOR_READ       10    // Delay giữa các lần đọc sensor (hàm đơn)
+#define DELAY_SENSOR_READ_ALL   10    // Delay giữa các lần đọc sensor (hàm scanAll)
+
+// ================= STATE =================
+enum State {
+    IDLE,
+    STEP_FORWARD,
+    TRY_RIGHT,
+    CHECK_RIGHT,
+    BACK_FROM_RIGHT,
+    DECIDE_AFTER_STOP,
+    TRY_LEFT_M1,
+    CHECK_LEFT_M1,
+    TURNING_180_FINISH,
+    STEP_FORWARD_M2,
+    TRY_LEFT_M2,
+    CHECK_LEFT_M2,
+    BACK_FROM_LEFT_M2,
+    DECIDE_M2,
+    TURNING_RIGHT_M2,
+    TURNING_LEFT_M2,
+    TURNING_180_A_M2,
+    TURNING_180_SCAN_M2,
+    TURNING_180_B_M2
+};
+
+State currentState = IDLE;
+
+VL53L0X sensorL, sensorF, sensorR;
+
+volatile long encL = 0;
+volatile long encR = 0;
+
+bool waitingStart  = false;
+bool waitingDirect = false;
+unsigned long startTime = 0;
+
+int sL, sF, sR;
+int runL, runR;
+int curPwmA = 0;
+int curPwmB = 0;
+bool flagRight = false;
+
+// ================= ENCODER =================
+void isrLeft() {
+    if (digitalRead(ENLA)) encL += -1;
+    else                   encL -= -1;
+}
+void isrRight() {
+    if (digitalRead(ENLB)) encR += 1;
+    else                   encR -= 1;
+}
+
+// ================= MOTOR =================
+void stopMotor() {
+    analogWrite(PWMA, 0);
+    analogWrite(PWMB, 0);
+    curPwmA = 0;
+    curPwmB = 0;
+}
+
+void driveForwardKp() {
+    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+
+    if (curPwmA < SPEED_A || curPwmB < SPEED_B) {
+        analogWrite(PWMA, curPwmA);
+        analogWrite(PWMB, curPwmB);
+        return;
+    }
+
+    float error = (float)(abs(encL) - abs(encR));
+    float correction = KP * error;
+    int pwmA = constrain((int)(SPEED_A - correction), 20, 255);
+    int pwmB = constrain((int)(SPEED_B + correction), 20, 255);
+    analogWrite(PWMA, pwmA);
+    analogWrite(PWMB, pwmB);
+}
+
+void driveForward() {
+    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+    analogWrite(PWMA, curPwmA);
+    analogWrite(PWMB, curPwmB);
+}
+
+void driveBackward() {
+    digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
+    digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
+    analogWrite(PWMA, SPEED_A);
+    analogWrite(PWMB, SPEED_B);
+}
+
+void driveRight() {
+    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
+    analogWrite(PWMA, SPEED_TURN);
+    analogWrite(PWMB, SPEED_TURN);
+}
+
+void driveLeft() {
+    digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
+    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+    analogWrite(PWMA, SPEED_TURN);
+    analogWrite(PWMB, SPEED_TURN);
+}
+
+// ================= SENSOR =================
+void scanF() {
+    long sum = 0;
+    for (int i = 0; i < 4; i++) {
+        sum += sensorF.readRangeContinuousMillimeters();
+        delay(DELAY_SENSOR_READ);
+    }
+    sF = sum / 4;
+}
+
+void scanLR() {
+    sL = sensorL.readRangeContinuousMillimeters();
+    sR = sensorR.readRangeContinuousMillimeters();
+    if (sL > runL) runL = sL;
+    if (sR > runR) runR = sR;
+}
+
+void scanAll() {
+    long sumL = 0, sumF = 0, sumR = 0;
+    for (int i = 0; i < 4; i++) {
+        sumL += sensorL.readRangeContinuousMillimeters();
+        sumF += sensorF.readRangeContinuousMillimeters();
+        sumR += sensorR.readRangeContinuousMillimeters();
+        delay(DELAY_SENSOR_READ_ALL);
+    }
+    sL = sumL / 4;
+    sF = sumF / 4;
+    sR = sumR / 4;
+}
+
+// ================= SETUP =================
+void setup() {
+    pinMode(BTN_START,  INPUT_PULLUP);
+    pinMode(BTN_DIRECT, INPUT_PULLUP);
+    pinMode(LED, OUTPUT);
+    pinMode(AIN1,OUTPUT); pinMode(AIN2,OUTPUT);
+    pinMode(BIN1,OUTPUT); pinMode(BIN2,OUTPUT);
+    pinMode(PWMA,OUTPUT); pinMode(PWMB,OUTPUT);
+    pinMode(STBY,OUTPUT);
+    digitalWrite(STBY, HIGH);
+
+    pinMode(ENRA,INPUT_PULLUP); pinMode(ENRB,INPUT_PULLUP);
+    pinMode(ENLA,INPUT_PULLUP); pinMode(ENLB,INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENRA), isrLeft,  RISING);
+    attachInterrupt(digitalPinToInterrupt(ENRB), isrRight, RISING);
+
+    pinMode(XSHUT_L,OUTPUT); pinMode(XSHUT_F,OUTPUT); pinMode(XSHUT_R,OUTPUT);
+    digitalWrite(XSHUT_L,LOW); digitalWrite(XSHUT_F,LOW); digitalWrite(XSHUT_R,LOW);
+    delay(200);
+    Wire.begin();
+
+    digitalWrite(XSHUT_L,HIGH); delay(50);
+    sensorL.init(); sensorL.setAddress(0x30); sensorL.startContinuous();
+
+    digitalWrite(XSHUT_F,HIGH); delay(50);
+    sensorF.init(); sensorF.setAddress(0x31); sensorF.startContinuous();
+
+    digitalWrite(XSHUT_R,HIGH); delay(50);
+    sensorR.init(); sensorR.setAddress(0x32); sensorR.startContinuous();
+}
+
+// ================= LOOP =================
+void loop() {
+
+    // ── IDLE ────────────────────────────────────────────────
+    if (currentState == IDLE) {
+        stopMotor();
+
+        // PB10 → Logic 2 (STEP_FORWARD_M2)
+        if (!waitingStart && !waitingDirect && digitalRead(BTN_START) == LOW) {
+            waitingStart = true;
+            startTime = millis();
+            digitalWrite(LED, HIGH);
+        }
+        if (waitingStart && millis() - startTime >= 1000) {
+            waitingStart = false;
+            digitalWrite(LED, LOW);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            curPwmA = 0; curPwmB = 0;
+            runL = 0; runR = 0;
+            currentState = STEP_FORWARD_M2;
+        }
+
+        // PB11 → Logic 1 (STEP_FORWARD, bỏ phần lùi/căn giữa)
+        if (!waitingDirect && !waitingStart && digitalRead(BTN_DIRECT) == LOW) {
+            waitingDirect = true;
+            startTime = millis();
+            digitalWrite(LED, HIGH);
+        }
+        if (waitingDirect && millis() - startTime >= 3000) {
+            waitingDirect = false;
+            digitalWrite(LED, LOW);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            curPwmA = 0; curPwmB = 0;
+            flagRight = false;
+            currentState = STEP_FORWARD;
+        }
+        return;
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  LOGIC 1 — PB11
+    // ════════════════════════════════════════════════════════
+
+    if (currentState == STEP_FORWARD) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < STEP_PULSE) {
+            sF = sensorF.readRangeContinuousMillimeters();
+            sR = sensorR.readRangeContinuousMillimeters();
+            if (sR > 300) flagRight = true;
+            if (sF <= 52.5) {
+                stopMotor(); delay(DELAY_STOP_MOTOR);
+                noInterrupts(); encL = 0; encR = 0; interrupts();
+                currentState = DECIDE_AFTER_STOP;
+                return;
+            }
+            if (curPwmA < SPEED_A) curPwmA = min(curPwmA + RAMP_STEP, (int)SPEED_A);
+            if (curPwmB < SPEED_B) curPwmB = min(curPwmB + RAMP_STEP, (int)SPEED_B);
+            delay(RAMP_DELAY);
+            driveForwardKp();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            curPwmA = 0; curPwmB = 0;
+            if (flagRight) {
+                flagRight = false;
+                currentState = TRY_RIGHT;
+            } else {
+                currentState = DECIDE_AFTER_STOP;
+            }
+        }
+        return;
+    }
+
+    if (currentState == TRY_RIGHT) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            driveRight();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = CHECK_RIGHT;
+        }
+        return;
+    }
+
+    if (currentState == CHECK_RIGHT) {
+        scanF();
+        if (sF > THRESHOLD_F) {
+            curPwmA = 0; curPwmB = 0;
+            currentState = STEP_FORWARD;
+        } else {
+            currentState = BACK_FROM_RIGHT;
+        }
+        return;
+    }
+
+    if (currentState == BACK_FROM_RIGHT) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            driveLeft();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = DECIDE_AFTER_STOP;
+        }
+        return;
+    }
+
+    if (currentState == DECIDE_AFTER_STOP) {
+        scanF();
+        if (sF > THRESHOLD_F) {
+            curPwmA = 0; curPwmB = 0;
+            currentState = STEP_FORWARD;
+        } else {
+            currentState = TRY_LEFT_M1;
+        }
+        return;
+    }
+
+    if (currentState == TRY_LEFT_M1) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            driveLeft();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = CHECK_LEFT_M1;
+        }
+        return;
+    }
+
+    if (currentState == CHECK_LEFT_M1) {
+        scanF();
+        if (sF > THRESHOLD_F) {
+            curPwmA = 0; curPwmB = 0;
+            currentState = STEP_FORWARD;
+        } else {
+            currentState = TURNING_180_FINISH;
+        }
+        return;
+    }
+
+    if (currentState == TURNING_180_FINISH) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            driveLeft();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            curPwmA = 0; curPwmB = 0;
+            currentState = STEP_FORWARD;
+        }
+        return;
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  LOGIC 2 — PB10
+    // ════════════════════════════════════════════════════════
+
+    if (currentState == STEP_FORWARD_M2) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < STEP_PULSE) {
+            sF = sensorF.readRangeContinuousMillimeters();
+            if (sF <= 52.5) {
+                stopMotor(); delay(DELAY_STOP_MOTOR);
+                noInterrupts(); encL = 0; encR = 0; interrupts();
+                currentState = DECIDE_M2;
+                return;
+            }
+            if (curPwmA < SPEED_A) curPwmA = min(curPwmA + RAMP_STEP, (int)SPEED_A);
+            if (curPwmB < SPEED_B) curPwmB = min(curPwmB + RAMP_STEP, (int)SPEED_B);
+            delay(RAMP_DELAY);
+            scanLR();
+            driveForwardKp();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            curPwmA = 0; curPwmB = 0;
+            currentState = TRY_LEFT_M2;
+        }
+        return;
+    }
+
+    if (currentState == TRY_LEFT_M2) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            driveLeft();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = CHECK_LEFT_M2;
+        }
+        return;
+    }
+
+    if (currentState == CHECK_LEFT_M2) {
+        scanF();
+        if (sF > THRESHOLD_F) {
+            runL = 0; runR = 0;
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = STEP_FORWARD_M2;
+        } else {
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = BACK_FROM_LEFT_M2;
+        }
+        return;
+    }
+
+    if (currentState == BACK_FROM_LEFT_M2) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            driveRight();
+        } else {
+            stopMotor(); delay(DELAY_TRANSITION);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = DECIDE_M2;
+        }
+        return;
+    }
+
+    if (currentState == DECIDE_M2) {
+        noInterrupts(); encL = 0; encR = 0; interrupts();
+        scanAll();
+        if (sF > THRESHOLD_F) {
+            runL = 0; runR = 0;
+            currentState = STEP_FORWARD_M2;
+        } else if (sR > sL && sR > THRESHOLD_LR) {
+            currentState = TURNING_RIGHT_M2;
+        } else if (sL > sR && sL > THRESHOLD_LR) {
+            currentState = TURNING_LEFT_M2;
+        } else {
+            currentState = TURNING_180_A_M2;
+        }
+        return;
+    }
+
+    if (currentState == TURNING_RIGHT_M2 || currentState == TURNING_LEFT_M2) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) {
+            if (currentState == TURNING_RIGHT_M2) driveRight();
+            else driveLeft();
+        } else {
+            stopMotor(); delay(DELAY_AFTER_TURN);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            runL = 0; runR = 0;
+            currentState = STEP_FORWARD_M2;
+        }
+        return;
+    }
+
+    if (currentState == TURNING_180_A_M2) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) driveRight();
+        else {
+            stopMotor(); delay(DELAY_AFTER_TURN);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = TURNING_180_SCAN_M2;
+        }
+        return;
+    }
+
+    if (currentState == TURNING_180_SCAN_M2) {
+        delay(DELAY_BEFORE_SCAN); scanF();
+        if (sF > THRESHOLD_F) currentState = STEP_FORWARD_M2;
+        else currentState = TURNING_180_B_M2;
+        return;
+    }
+
+    if (currentState == TURNING_180_B_M2) {
+        long avg = (abs(encL) + abs(encR)) / 2;
+        if (avg < TURN_90) driveRight();
+        else {
+            stopMotor(); delay(DELAY_AFTER_TURN);
+            noInterrupts(); encL = 0; encR = 0; interrupts();
+            currentState = STEP_FORWARD_M2;
+        }
+        return;
+    }
+}
